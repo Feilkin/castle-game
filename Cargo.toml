@@ -1,0 +1,20 @@
+[package]
+name = "bevy-raymarching"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bevy = { version = "0.8.1", features = [] }
+noise = "0.7.0"
+rand = "*"
+bevy_egui = "0.16.1"
+image = "*"
+
+[profile.dev]
+opt-level = 2
+lto = false
+
+[patch.crates-io]
+bevy = { path = "../bevy" }

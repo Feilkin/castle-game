@@ -1,0 +1,655 @@
+struct View {
+    view_proj: mat4x4<f32>,
+    inverse_view_proj: mat4x4<f32>,
+    view: mat4x4<f32>,
+    inverse_view: mat4x4<f32>,
+    projection: mat4x4<f32>,
+    inverse_projection: mat4x4<f32>,
+    world_position: vec3<f32>,
+    width: f32,
+    height: f32,
+};
+
+struct SkySettings {
+    planet_center: vec3<f32>,
+    planet_radius: f32,
+    atmosphere_radius: f32,
+    sun_distance: f32,
+    sun_axis: vec3<f32>,
+    density_falloff: f32,
+    wavelengths: f32,
+    scatter_strength: f32,
+    scatter_coefficients: vec3<f32>,
+}
+
+var<private> time: f32 = 960.;
+var<private> inscattering_points: i32 = 10;
+
+let seconds_in_day = 1440.;
+
+@group(0) @binding(0)
+var<uniform> view: View;
+
+let MAX_RT_STEPS = 180;
+
+struct RaymarchCamera {
+    fov: f32,
+    view_matrix: mat4x4<f32>,
+    view_matrix_inverse: mat4x4<f32>,
+}
+
+let play_area_size = vec3<f32>(511., 511., 64.);
+let play_area_size_h = vec3<f32>(255., 255., 64.);
+let heightmap_size = vec2<f32>(1023., 1023.);
+let voxel_size = vec3<f32>(511., 511., 64.);
+
+struct Towers {
+    count: u32,
+    towers: array<vec4<f32>, 32>,
+}
+
+struct Walls {
+    count: u32,
+    walls: array<vec4<f32>, 32>,
+}
+
+struct World {
+    time: f32,
+}
+
+@group(1) @binding(0)
+var<uniform> raymarch_camera: RaymarchCamera;
+@group(1) @binding(1)
+var texture: texture_2d<f32>;
+@group(1) @binding(2)
+var our_sampler: sampler;
+@group(1) @binding(3)
+var<uniform> towers: Towers;
+@group(1) @binding(4)
+var<uniform> walls: Walls;
+@group(1) @binding(5)
+var voxel_data: texture_3d<f32>;
+@group(1) @binding(6)
+var voxel_sampler: sampler;
+@group(1) @binding(7)
+var<uniform> world: World;
+@group(1) @binding(8)
+var<uniform> sky_settings: SkySettings;
+
+struct FragmentInput {
+    @builtin(position) position: vec4<f32>,
+    @location(0) world_position: vec4<f32>,
+    @location(1) world_normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+}
+
+fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
+    let K = vec4<f32>(1., 2. / 3., 1. / 3., 3.);
+    let p = abs(fract(c.xxx + K.xyz) * 6.0 - K.www);
+    return c.z * mix(K.xxx, clamp(p - K.xxx, vec3<f32>(0.0), vec3<f32>(1.0)), c.y);
+}
+
+fn modulo_vec3(a: vec3<f32>, b: vec3<f32>) -> vec3<f32> {
+    var r = a % b;
+    r.x = select(r.x + abs(b.x), r.x, r.x >= 0.);
+    r.y = select(r.y + abs(b.y), r.y, r.y >= 0.);
+    r.z = select(r.z + abs(b.z), r.z, r.z >= 0.);
+    return r;
+}
+
+fn modulo_vec2(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
+    var r = a % b;
+    r.x = select(r.x + abs(b.x), r.x, r.x >= 0.);
+    r.y = select(r.y + abs(b.y), r.y, r.y >= 0.);
+    return r;
+}
+
+// stolen from https://www.shadertoy.com/view/4tcGDr
+// ray direction in view space (Y up)
+fn ray_direction(fieldOfView: f32, size: vec2<f32>, fragCoord: vec2<f32>) -> vec3<f32> {
+    let xy = fragCoord - size / 2.0;
+    let z = size.y / tan(radians(fieldOfView) / 2.0);
+    return normalize(vec3<f32>(xy.x, -xy.y, -z));
+}
+
+fn opSmoothUnion(d1: f32, d2: f32, k: f32) -> f32 {
+    let h = clamp(0.5 + 0.5*(d2-d1)/k, 0.0, 1.0);
+    return mix(d2, d1, h) - k*h*(1.0-h);
+}
+
+fn opRepeat(p: vec3<f32>, c: vec3<f32>) -> vec3<f32> {
+    let q = modulo_vec3((p + 0.5*c), c) - 0.5*c;
+    return q;
+}
+
+fn opRepeatFinite(p: vec3<f32>, c: f32, l: vec3<f32>) -> vec3<f32> {
+    let q = p - c*clamp(round(p/c), -l, l);
+    return q;
+}
+
+fn opRepeatFiniteH(p: vec3<f32>, c: f32, l: vec3<f32>) -> vec3<f32> {
+    let q = p - c*clamp(round(p/c), vec3<f32>(0.), l);
+    return q;
+}
+
+fn opSubstract(d1: f32, d2: f32) -> f32 {
+    return max(-d1, d2);
+}
+
+
+fn rotateZ(p: vec3<f32>, r: f32) -> vec3<f32> {
+    var n = p;
+    n.x = p.x * cos(r) - p.y * sin(r);
+    n.y = p.x * sin(r) + p.y * cos(r);
+    return n;
+}
+
+
+fn rotateY(p: vec3<f32>, r: f32) -> vec3<f32> {
+    var n = p;
+    n.x = p.x * cos(r) + p.z * sin(r);
+    n.z = -p.x * sin(r) + p.z * cos(r);
+    return n;
+}
+
+fn sdBox(p: vec3<f32>, b: vec3<f32>) -> f32 {
+    let q = abs(p) - b;
+    return length(max(q,vec3<f32>(0.0))) + min(max(q.x,max(q.y,q.z)),0.0);
+}
+
+fn sdSphere(p: vec3<f32>, radius: f32) -> f32 {
+    return length(p) - radius;
+}
+
+fn sdCylinder(p: vec3<f32>, radius: f32, height: f32) -> f32 {
+    let d = abs(vec2<f32>(length(p.xy), p.z)) - vec2<f32>(height, radius);
+    return min(max(d.x, d.y), 0.0) + length(max(d, vec2<f32>(0.0)));
+}
+
+fn sdCone(p: vec3<f32>, c: vec2<f32>, height: f32) -> f32 {
+    let q = length(p.xy);
+    return max(dot(c.xy, vec2<f32>(q, p.z)), -height-p.z);
+}
+
+fn disBricks(p: vec3<f32>, d: f32) -> f32 {
+    var d = d;
+    let row = floor(p.z * 1.7) % 2.0;
+    let column = floor(p.x * 0.57) % 2.0;
+
+
+    d -= 0.055*pow(0.5 + 0.5*sin(p.x * 3.0 + row * 1.), 0.01);
+    d -= 0.055*pow(0.5 + 0.5*sin(p.y * 5.0 + row * 1. + 0.13), 0.01);
+
+
+    return d;
+}
+
+fn sdWall(p: vec3<f32>, b: vec3<f32>) -> f32 {
+    var d = sdBox(p, b) - 0.04;
+    let q = opRepeatFinite(p - vec3<f32>(0., b.y, b.z + 0.2), 1.2, vec3<f32>(floor(b.x / 1.2), 0., 0.));
+    d = min(d, sdBox(q, vec3<f32>(0.3, 0.1, 0.4)) - 0.04);
+    let q = opRepeatFinite(p - vec3<f32>(0., -b.y, b.z + 0.2), 1.2, vec3<f32>(floor(b.x / 1.2), 0., 0.));
+    d = min(d, sdBox(q, vec3<f32>(0.3, 0.1, 0.4)) - 0.04);
+
+    return d;
+}
+
+fn sdTower(p: vec3<f32>, height: f32, current_d: f32) -> f32 {
+//    var d=sdCylinder(p, height, 2.);
+    var d=sdBox(p, vec3<f32>(2., 2., height)) - 0.04;
+    if (d <= current_d) {
+        d = max(d, -sdBox(p - vec3<f32>(0., 0., height - 0.1), vec3<f32>(3., 0.8, 0.4)));
+        d = max(d, -sdBox(p - vec3<f32>(0., 0., height - 0.1), vec3<f32>(0.8, 3., 0.4)));
+    //////    d = max(d, -sdCylinder(p - vec3<f32>(0., 0., height - 0.1), 0.4, 1.8));
+        d = max(d, -sdBox(p - vec3<f32>(0., 0., height - 0.1), vec3<f32>(1.8, 1.8, 0.4)));
+        let q = opRepeatFinite(p - vec3<f32>(0., 0., 2.1), 2.3, vec3<f32>(0., 0., floor(height / 4.)));
+        d = max(d, -sdBox(q, vec3<f32>(4., 0.31, 0.37)));
+        d = max(d, -sdBox(q, vec3<f32>(0.31, 4., 0.37)));
+    }
+    return d;
+}
+
+fn sdBadGrass(p: vec3<f32>, ray_distance: f32) -> f32 {
+    var d = p.z - 0.4;
+    let grass_start = 25.;
+    let grass_fade = 75.;
+
+    if (ray_distance < grass_start) {
+        let distance_factor = 1.;
+        var uv = abs(p.xy * 0.3 * distance_factor) % 1.0 ;
+        var r = textureSampleLevel(texture, our_sampler, uv, 0.).r;
+        r = clamp(r, 0.05, 0.7);
+        d = p.z - r;
+    } else if (ray_distance < grass_fade) {
+        let distance_factor = (ray_distance - grass_start)/(grass_fade - grass_start);
+        var uv = abs(p.xy * 0.3) % 1.0;
+        var r = textureSampleLevel(texture, our_sampler, uv, 0.).r;
+        r = clamp(r, 0.05, 0.7);
+        r = mix(r, 0.4, distance_factor);
+        d = p.z - r;
+    }
+
+    return d;
+}
+
+fn sdGateway(p: vec3<f32>, b: vec3<f32>) -> f32 {
+    let d = sdBox(p, b);
+
+    return d;
+}
+
+fn ground_at(p: vec2<f32>) -> f32 {
+    let p = p + play_area_size_h.xy;
+//    var uv = modulo_vec2(p - vec2<f32>(-128., -128.), vec2<f32>(512., 512.)) / vec2<f32>(511., 511.);
+    var uv = p / play_area_size.xy;
+    var r = textureSampleLevel(texture, our_sampler, uv, 0.).r;
+    return r;
+}
+
+fn sdGround(p: vec3<f32>) -> f32 {
+    let p = p + vec3<f32>(play_area_size_h.xy, 0.);
+//    if (p.x < 0. || p.x > 1023. || p.y < 0. || p.y > 1023.) { return p.z; }
+//    var uv = modulo_vec3(p  - vec3<f32>(-128., -128., 0.), vec3<f32>(512., 512., 300.)) / vec3<f32>(511., 511., 63.);
+    var uv = p / play_area_size * vec3<f32>(0.5, 0.5, 1.);
+    return textureSampleLevel(voxel_data, voxel_sampler, uv, 0.).r;
+}
+
+fn map(ray_pos: vec3<f32>, ray_distance: f32, shadow_pass: bool) -> vec2<f32> {
+    let wall_height = 1.5;
+    var ret = vec2<f32>(1000., 2.);
+
+    // ground
+    var r = sdGround(ray_pos);
+    ret.x = min(r, ret.x);
+//    if (ret.x <= 0.001) {
+        ret.y = 1.;
+//    }
+
+    for (var i = 0u; i < towers.count; i++) {
+        let tower = towers.towers[i];
+        let tower_pos = tower.xyz;
+        let ground_level_t = ground_at(tower.xy);
+        let bb_sphere = sdSphere(ray_pos - tower_pos - vec3<f32>(0., 0., 3. + ground_level_t), tower.w * 1.2);
+//        let bb_sphere = 0.;
+        if (bb_sphere < ret.x) {
+            let tower_d = sdTower(ray_pos - tower_pos - vec3<f32>(0., 0., 3. + ground_level_t), tower.w, ret.x);
+            if (tower_d < ret.x) {
+                ret.x = tower_d;
+                ret.y = 2.;
+            }
+        }
+    }
+
+    for (var i = 0u; i < walls.count; i++) {
+        let wall = walls.walls[i];
+        let wall_len = wall.w;
+        let wall_rot = wall.z;
+        let wall_pos = vec3<f32>(wall.xy, 0.5);
+        let ground_level_w = ground_at(ray_pos.xy);
+        let local_pos = rotateZ(ray_pos - wall_pos, -wall_rot) - vec3<f32>(-wall_len / 2.0, 0., 0.9 + ground_level_w);
+
+        let bb_box = sdBox(local_pos, vec3<f32>(wall_len / 2. + 0.5, 1.2, wall_height + 1.5));
+
+        if (bb_box < ret.x) {
+            let wall_d = sdWall(local_pos, vec3<f32>(wall_len / 2., 1., wall_height));
+
+            if (wall_d < ret.x) {
+                ret.y = 2.;
+            }
+//            ret.x = opSmoothUnion(ret.x, wall_d, 0.1);
+            ret.x = min(ret.x, wall_d);
+            ret.x = max(-sdGateway(local_pos - vec3<f32>(0., 0., 2.38), vec3<f32>(wall_len / 2.0 + 0.4, 0.7, 0.9)), ret.x);
+        }
+    }
+
+    // main gate
+    ret.x = max(-sdGateway(ray_pos - vec3<f32>(0., 0., 1.), vec3<f32>(1.5, 2., 1.4)), ret.x);
+
+    let drawbridge = sdBox(ray_pos - vec3<f32>(0., 0., .1), vec3<f32>(1.49, 4., 0.1));
+    ret.y = select(ret.y, 4., drawbridge < ret.x);
+    ret.x = min(ret.x, drawbridge);
+
+    return ret;
+}
+
+fn raymarch(ray_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
+    let max_steps = MAX_RT_STEPS;
+    let epsilon = 0.01;
+
+    var res = vec3<f32>(-1., -1., 0.);
+    var tmin = 0.4;
+    var tmax = 600.0;
+    // raycast floor plane
+//    let tp1 = (-1.0-ray_pos.z) / ray_dir.z;
+//    if (tp1 > 0.0) {
+//        tmax = min(tmax, tp1);
+//        res.x = tp1;
+//        res.y = 1.0;
+//    }
+
+    var step = 0;
+    var t = tmin;
+    loop {
+        step += 1;
+        if (step >= max_steps) { break; }
+        let pos = ray_pos + ray_dir * t;
+        if (pos.z < 0.) { res.y = -2.; break; }
+        if (pos.x > play_area_size_h.x && ray_dir.x > 0.) { break; }
+        if (pos.y > play_area_size_h.y && ray_dir.y > 0.) { break; }
+        if (pos.x < -play_area_size_h.x && ray_dir.x < 0.) { break; }
+        if (pos.y < -play_area_size_h.y && ray_dir.y < 0.) { break; }
+
+//        let map_bb = sdBox(pos, vec3<f32>(45., 25., 25.));
+//
+//        if ((map_bb <= res.x) || res.x == -1.) {
+            let d = map(pos, t, false);
+
+            t += d.x;
+
+            if (d.x <=epsilon) {
+                res.x = t;
+                res.y = d.y;
+                break;
+            }
+//        } else {
+//            t += map_bb;
+//        }
+        if (t >= tmax) { break; }
+    }
+
+    res.z = f32(step);
+
+    return res;
+}
+
+fn ray_sphere_intersection(sphere_pos: vec3<f32>, radius: f32, ray_pos: vec3<f32>, ray_dir: vec3<f32>) -> f32 {
+    let L = sphere_pos - ray_pos;
+    let tc = dot(L, ray_dir);
+
+    let d2: f32 = (tc*tc) - (length(L) * length(L));
+    let radius2 = radius * radius;
+
+    let t1c = sqrt(radius2 - d2);
+    let t1 = tc - t1c;
+    let t2 = tc + t1c;
+
+    return max(t1, t2);
+}
+
+fn sky_dir_to_sun(p: vec3<f32>) -> vec3<f32> {
+    let sun_distance = 1500000.;
+    let sun_pos = rotateY(vec3<f32>(sun_distance, 0., 0.), 3.7);
+
+    return normalize(sun_pos);
+}
+
+fn sky_density_at(p: vec3<f32>) -> f32 {
+    let planet_center = vec3<f32>(0., 0., 0.);
+    let planet_radius = sky_settings.planet_radius;
+    let atmosphere_radius = planet_radius + sky_settings.atmosphere_radius;
+    let density_falloff = sky_settings.density_falloff;
+    let height_above_surface = length(p - planet_center) - planet_radius;
+    let height01 = height_above_surface / (atmosphere_radius - planet_radius);
+    let local_density = exp(-height01 * density_falloff);
+
+    return local_density;
+}
+
+fn sky_optical_depth(ray_origin: vec3<f32>, ray_dir: vec3<f32>, ray_length: f32) -> f32 {
+    var sample_point = ray_origin;
+    let step_size = ray_length / f32(inscattering_points - 1);
+    var optical_depth = 0.;
+
+    for (var i = 0; i < inscattering_points; i++) {
+        let local_density = sky_density_at(sample_point);
+        optical_depth += local_density * step_size;
+        sample_point += ray_dir * step_size;
+    }
+
+    return optical_depth;
+}
+
+fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
+    let planet_center = vec3<f32>(0., 0., 0.);
+    let atmosphere_radius = 1.1;
+    let earth_radius = .997;
+    var inscatter_point = vec3<f32>(0., 0., earth_radius);
+    let distance_to_sky = ray_sphere_intersection(planet_center, atmosphere_radius, inscatter_point, ray_dir);
+
+    let step_size = distance_to_sky / f32(inscattering_points - 1);
+    var inscattered_light = vec3(0.);
+
+    for (var i = 0; i < inscattering_points; i++) {
+        let dir_to_sun = sky_dir_to_sun(inscatter_point);
+        let sunray_length = ray_sphere_intersection(planet_center, atmosphere_radius, inscatter_point, dir_to_sun);
+        let sunray_optical_depth = sky_optical_depth(inscatter_point, dir_to_sun, sunray_length);
+        let viewray_optical_depth = sky_optical_depth(inscatter_point, -ray_dir, step_size * f32(i));
+        let transmittance = exp(-(sunray_optical_depth + viewray_optical_depth) * sky_settings.scatter_coefficients);
+        let local_density = sky_density_at(inscatter_point);
+
+        inscattered_light += local_density * transmittance * sky_settings.scatter_coefficients * step_size;
+        inscatter_point += ray_dir * step_size;
+    }
+
+    return inscattered_light;
+}
+
+fn map_color(color: f32, ray_pos: vec3<f32>, normal: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
+    if (color == 1.0) {
+        if (ground_at(ray_pos.xy) < 0.) {
+            // hole
+            return vec3<f32>(0.43, 0.43, 0.13) * (1. - max(-ray_pos.z / 16., 1.0));
+        }
+
+        var ground_color = vec3<f32>(0.43, 0.43, 0.13);
+
+        if (ray_pos.z > 26. + sin(ray_pos.y * .2 + ray_pos.x * 0.03)) {
+            ground_color = vec3<f32>(0.71, 0.91, 0.75);
+        }
+
+        if (abs(normal.z) > 0.95) {
+            ground_color = vec3<f32>(0.31, 0.59, 0.14);
+            if (ray_pos.z > 21. + sin(ray_pos.x * .1)) {
+                ground_color = vec3<f32>(0.77, 0.97, 0.81);
+            }
+        }
+
+        if (ray_pos.z < 1.7) {
+            ground_color = vec3<f32>(0.71, 0.69, 0.14);
+        }
+
+        let a = floor(modulo_vec2(ray_pos.xy * 8., vec2<f32>(16., 16.)));
+        if (a.x == 0. || a.y == 0.) {
+            return ground_color;
+        } else {
+            return ground_color * 0.81;
+        }
+    }
+    if (color == 2.0) { return vec3<f32>(0.1, 0.12, 0.13); }
+    if (color == 3.0) { return vec3<f32>(0.52, 0.7, 0.13); }
+    if (color == 4.0) { return vec3<f32>(0.32, 0.11, 0.03); }
+    if (color == 5.0) { return vec3<f32>(0.81, 0.11, 0.13); }
+    if (color == 6.0) { return vec3<f32>(0.71, 0.31, 0.23); }
+
+    if (color >= 100.) {
+        return hsv2rgb(vec3<f32>(color - 100., 0.8, 0.5));
+    }
+
+    if (color == -1.0) {
+        // sky
+        return sky_color(ray_dir);
+    }
+    if (color == -2.0) {
+        // water
+        let bounce = reflect(ray_dir, vec3<f32>(0., 0., 1.));
+        return sky_color(bounce);
+    }
+
+    return vec3<f32>(1., 0., 1.);
+}
+
+fn calculate_soft_shadow(ray_origin: vec3<f32>, ray_dir: vec3<f32>, distance_from_eye: f32) -> f32 {
+    if (distance_from_eye > 500.) { return 1.; }
+    var res = 1.0;
+    var t = 0.2;
+
+    let max_steps = 24;
+    var step = 0;
+    loop {
+        step += 1;
+        if (step >= max_steps) { break; }
+
+        let h = map(ray_origin + ray_dir * t, 1.0, true).x;
+        let s = clamp(8.0*h/t, 0., 1.);
+        res = min(res, s);
+        t += clamp(h, 0.06, 0.4);
+        if (res < 0.01) { break; };
+    }
+
+    return res;
+}
+
+fn calculate_normal(pos: vec3<f32>, distance_from_eye: f32) -> vec3<f32> {
+    let e = vec2<f32>(1.0,-1.0)*0.57734231*0.000005;
+    return normalize( e.xyy * (map( pos + e.xyy, distance_from_eye, false).x) +
+                      e.yyx * (map( pos + e.yyx, distance_from_eye, false).x) +
+                      e.yxy * (map( pos + e.yxy, distance_from_eye, false).x) +
+                      e.xxx * (map( pos + e.xxx, distance_from_eye, false).x) );
+}
+
+fn calculate_ground_normal(pos: vec2<f32>) -> vec3<f32> {
+    let e = vec2<f32>(1.0,0.0)*0.47734231*.7;
+    return normalize(vec3<f32>(
+        2.*(ground_at(pos + e.xy) - ground_at(pos - e.xy))/e.x,
+        2.*(ground_at(pos + e.yx) - ground_at(pos - e.yx))/e.x,
+        4.
+    ));
+}
+
+fn calculate_ao(pos: vec3<f32>, normal: vec3<f32>) -> f32 {
+    var occ = 0.;
+    var sca = 1.0;
+    for (var i = 0; i < 5; i += 1) {
+        let h = 0.01 + 0.12 * f32(i)/4.0;
+        let d = map(pos + h*normal, 0.01, true).x;
+        occ += (h-d) * sca;
+        sca *= 0.95;
+        if (occ > 0.35) { break; }
+    }
+    return clamp(1.0 - 3.0*occ, 0.0, 1.0) * (0.5 + 0.5*normal.z);
+}
+
+@fragment
+fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {
+    let AA = 1;
+    var total = vec3<f32>(0.);
+    for (var m=0; m<AA; m++) {
+    for (var n=0; n<AA; n++) {
+        let o = vec2<f32>(f32(m), f32(n)) / 4. - 0.5;
+        let p = in.position.xy + o;
+
+        let ray_in_view_space = ray_direction(raymarch_camera.fov, vec2<f32>(view.width, view.height), p);
+        let ray_dir_unnorm = raymarch_camera.view_matrix_inverse * vec4<f32>(ray_in_view_space, 0.0);
+        let ray_dir = normalize(ray_dir_unnorm.xyz);
+
+        let ray_pos: vec3<f32> = (raymarch_camera.view_matrix_inverse * vec4<f32>(0., 0., 0., 1.)).xyz;
+        let ray_pos = ray_pos;
+
+        let res = raymarch(ray_pos, ray_dir);
+
+
+        if (res.z == f32(MAX_RT_STEPS)) {
+            total += vec3<f32>(0., 0., 0.07);
+        } else {
+            let t = res.x;
+            var m = res.y;
+            let pos = ray_pos + ray_dir * t;
+            let distance_from_eye = distance(ray_pos, pos);
+            var normal = vec3<f32>(0., 0., 1.);
+            if (m > 0.5 && m < 1.5) {
+                normal = calculate_ground_normal(pos.xy);
+            }
+
+            if (m > 1.5) {
+                normal = calculate_normal(pos, distance_from_eye);
+            }
+        //    let normal = select(vec3<f32>(0., 0., 1.), calculate_normal(pos), m > 1.5);
+            var color = map_color(m, pos, normal, ray_dir);
+
+            if (m > 0.) {
+                var light_acc = vec3<f32>(0.);
+                let occ = calculate_ao(pos, normal);
+
+                // sun
+                let dir_to_sun = sky_dir_to_sun(pos);
+                if (dir_to_sun.z > -0.47) {
+                    let sun_color = mix(sky_color(dir_to_sun), vec3<f32>(1.3, 1.0, 0.7), 0.5 * clamp(dir_to_sun.z, 0., 1.));
+                    let lig = dir_to_sun;
+                    let hal = normalize(lig-ray_dir);
+                    var dif = clamp(dot(normal, lig), 0.0, 1.0);
+                    dif *= calculate_soft_shadow(pos, lig, distance_from_eye);
+    //                var spe = pow(clamp(dot(normal, hal), 0.0, 1.0), 16.0);
+    //                spe *= dif;
+    //                spe *= 0.04*0.96*pow(clamp(1.0-dot(hal, lig), 0.0, 1.0), 5.0);
+                    light_acc += color*1.2*dif*sun_color;
+    //                light_acc += 5.*spe*vec3<f32>(1.3, 1., 0.6)*1.0;
+                }
+                // point lights
+                {
+                    for (var i = 0u; i < towers.count; i++) {
+                        let tower = towers.towers[i];
+                        let tower_pos = tower.xyz;
+                        let ground_level_t = ground_at(tower.xy);
+                        let local_pos = pos - vec3<f32>(tower_pos.x, tower_pos.y, 3.0 + ground_level_t);
+                        let dist = length(local_pos);
+                        if (dist < 10.) {
+                            let intensity = 1. / pow(dist, 4.) * 1500.;
+                            let lig = normalize(-local_pos);
+                            let hal = normalize(lig-ray_dir);
+                            var dif = clamp(dot(normal, lig), 0.0, 1.0);
+                            dif *= calculate_soft_shadow(pos, lig, distance_from_eye);
+            //                var spe = pow(clamp(dot(normal, hal), 0.0, 1.0), 16.0);
+            //                spe *= dif;
+            //                spe *= 0.04*0.96*pow(clamp(1.0-dot(hal, lig), 0.0, 1.0), 5.0);
+                            light_acc += intensity*color*2.2*dif*vec3<f32>(1.0, 0.33, 0.0);
+            //                light_acc += 5.*spe*vec3<f32>(1.3, 1., 0.6)*1.0;
+                        }
+                    }
+
+                }
+                // sky (ambient)
+                {
+                    let daytime_coeff = 1. - min(max(sin(world.time)* 3., 0.0), 0.97);
+                    let sky_bounce = reflect(dir_to_sun, normal);
+                    let sky_reflect_color = max(sky_color(sky_bounce) * 0.37, vec3<f32>(0.02, 0.02, 0.17));
+                    var dif = sqrt(clamp(0.5+0.5*normal.z, 0.0, 1.0));
+                    if (m > 0.) {
+                        dif *= occ;
+                    }
+                    if (m > 2. || ground_at(pos.xy) > 0.) {
+                        light_acc += color*dif*sky_reflect_color;
+                    }
+                }
+
+//                color = mix(light_acc, normal, 0.1);
+                color = light_acc;
+                // fog
+                let fog_color = vec3<f32>(0.7, 0.7, 0.9)*sky_color(vec3<f32>(0., 0., 1.));
+                color = mix(color, fog_color, 1.0-exp(-0.00001*pow(t, 2.1)));
+
+//                color = vec3<f32>(t / 1000., res.z / f32(MAX_RT_STEPS), 0.);
+//                color = vec3<f32>(t / 250., 0., 0.);
+//                color = vec3<f32>(0., 0., select(0., 1., normal.z > 0.93));
+//                color = normal;
+//                color = vec3<f32>(occ, 0., 0.);
+//                color = vec3<f32>(max(ground_at(pos.xy), 0.) / 100.,-min(ground_at(pos.xy), 0.) / 100., 0.);
+//                color = vec3<f32>(m / 5., 0., 0.);
+            }
+            total += color;
+        }
+
+    }
+    }
+
+    return vec4<f32>(total / f32(AA*AA), 1.0);
+}
