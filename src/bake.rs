@@ -1,5 +1,7 @@
 //! Sdf Voxel Baking
 
+use std::num::NonZeroU32;
+
 use bevy::prelude::*;
 use bevy::render::extract_resource::{ExtractResource, ExtractResourcePlugin};
 use bevy::render::render_asset::RenderAssets;
@@ -7,9 +9,8 @@ use bevy::render::render_graph::RenderGraph;
 use bevy::render::render_graph::{Node as RenderNode, NodeRunError, RenderGraphContext};
 use bevy::render::render_resource::{
     BindGroup, BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-    BindGroupLayoutEntry, BindingResource, BindingType, BufferBindingType, BufferDescriptor,
-    BufferInitDescriptor, BufferUsages, CachedComputePipelineId, CachedPipelineState,
-    ComputePassDescriptor, ComputePipelineDescriptor, DynamicStorageBuffer, Extent3d,
+    BindGroupLayoutEntry, BindingResource, BindingType, BufferBindingType, CachedComputePipelineId,
+    CachedPipelineState, ComputePassDescriptor, ComputePipelineDescriptor, Extent3d,
     ImageCopyBuffer, ImageCopyTexture, ImageDataLayout, PipelineCache, SamplerBindingType,
     ShaderStages, ShaderType, StorageBuffer, StorageTextureAccess, TextureDescriptor,
     TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureViewDimension,
@@ -18,7 +19,6 @@ use bevy::render::render_resource::{
 use bevy::render::renderer::{RenderContext, RenderDevice, RenderQueue};
 use bevy::render::texture::GpuImage;
 use bevy::render::{RenderApp, RenderStage};
-use std::num::NonZeroU32;
 
 const WORKGROUP_SIZE: u32 = 8;
 

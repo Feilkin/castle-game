@@ -1,7 +1,8 @@
 //! NPC and Task related things
+use std::collections::VecDeque;
+
 use bevy::math::Vec3Swizzles;
 use bevy::prelude::*;
-use std::collections::VecDeque;
 
 pub const MAX_DUDES: usize = 100;
 

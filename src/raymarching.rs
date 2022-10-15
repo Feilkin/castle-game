@@ -1,12 +1,14 @@
 //! Raymarching stuff
-use crate::widgets::{Curve, Widget};
+use std::any::Any;
+use std::ops::RangeInclusive;
+
 use bevy::prelude::*;
 use bevy::render::render_resource::ShaderType;
 use bevy_egui::egui::plot::Plot;
 use bevy_egui::egui::{Color32, Ui};
 use bevy_egui::{egui, EguiContext};
-use std::any::Any;
-use std::ops::RangeInclusive;
+
+use crate::widgets::{Curve, Widget};
 
 // Raymarching related settings
 

@@ -1,8 +1,9 @@
 //! Pan orbit camera
-use crate::fsr::FsrSettings;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::camera::Projection;
+
+use crate::fsr::FsrSettings;
 
 pub struct CameraPlugin;
 

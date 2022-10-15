@@ -3,53 +3,43 @@
 //! This example uses a specialized pipeline.
 #![feature(trivial_bounds)]
 
-mod bake;
-mod camera;
-mod fsr;
-mod npc;
-mod raymarching;
-mod widgets;
+use std::collections::VecDeque;
 
-use crate::bake::{BakeVoxelPlugin, HeightMap, VoxelData};
-use crate::camera::{CameraPlugin, PanOrbitCamera};
-use crate::fsr::{FsrPlugin, FsrSettings, LowResTexture};
-use crate::raymarching::{RaymarchPlugin, SkySettings};
 use bevy::asset::AssetServerSettings;
-use bevy::diagnostic::{Diagnostics, FrameTimeDiagnosticsPlugin, LogDiagnosticsPlugin};
-use bevy::input::mouse::{MouseMotion, MouseWheel};
+use bevy::diagnostic::{Diagnostics, FrameTimeDiagnosticsPlugin};
 use bevy::math::Vec3Swizzles;
-use bevy::reflect::Uuid;
-use bevy::render::camera::{Projection, ScalingMode, Viewport};
-use bevy::render::mesh::MeshVertexBufferLayout;
-use bevy::render::render_asset::RenderAssets;
-use bevy::render::render_resource::encase::ArrayLength;
-use bevy::render::render_resource::{
-    AsBindGroupError, BindGroupLayout, PreparedBindGroup, RenderPipelineDescriptor,
-    SpecializedMeshPipelineError,
-};
+use bevy::render::camera::Projection;
 use bevy::render::renderer::RenderDevice;
-use bevy::render::texture::{FallbackImage, ImageSampler};
-use bevy::ui::UiPlugin;
+use bevy::render::texture::ImageSampler;
 use bevy::window::PresentMode;
 use bevy::{
     core_pipeline::clear_color::ClearColorConfig,
     prelude::*,
     reflect::TypeUuid,
     render::{
-        camera::RenderTarget,
         render_resource::{
             AsBindGroup, Extent3d, ShaderRef, ShaderType, TextureDescriptor, TextureDimension,
             TextureFormat, TextureUsages,
         },
-        texture::BevyDefault,
         view::RenderLayers,
     },
-    sprite::{Material2d, Material2dKey, Material2dPlugin, MaterialMesh2dBundle},
+    sprite::{Material2d, Material2dPlugin, MaterialMesh2dBundle},
 };
 use bevy_egui::egui::plot::{HLine, Line, Plot, PlotPoints};
 use bevy_egui::{egui, EguiContext, EguiPlugin};
 use noise::Seedable;
-use std::collections::VecDeque;
+
+use crate::bake::{BakeVoxelPlugin, HeightMap, VoxelData};
+use crate::camera::{CameraPlugin, PanOrbitCamera};
+use crate::fsr::{FsrPlugin, LowResTexture};
+use crate::raymarching::{RaymarchPlugin, SkySettings};
+
+mod bake;
+mod camera;
+mod fsr;
+mod npc;
+mod raymarching;
+mod widgets;
 
 fn main() {
     App::new()
@@ -371,10 +361,10 @@ fn generate_perlin_noise(width: u32, height: u32) -> Image {
     for (scale, amplitude) in amplitudes_and_scales {
         for y in 0..height as usize {
             for x in 0..width as usize {
-                let sx = (x as f64 * scale / width as f64);
-                let sy = (y as f64 * scale / height as f64);
+                let sx = x as f64 * scale / width as f64;
+                let sy = y as f64 * scale / height as f64;
                 let val = (perlin.get([sx, sy]) * amplitude) as f32;
-                let i = y * (width as usize) + x;
+                let i = y * width as usize + x;
                 data[i] += val;
                 data[i] = data[i].min(63.);
             }
@@ -382,8 +372,6 @@ fn generate_perlin_noise(width: u32, height: u32) -> Image {
     }
 
     let data: Vec<u8> = unsafe { std::mem::transmute(data) };
-
-    image::save_buffer("heightmap.png", &data, width, height, image::ColorType::L8);
 
     Image {
         data,

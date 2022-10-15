@@ -2,7 +2,6 @@
 use std::any::{Any, TypeId};
 use std::ops::RangeInclusive;
 
-use bevy::prelude::*;
 use bevy_egui::egui::plot::{Line, Plot, PlotPoints};
 use bevy_egui::egui::Ui;
 

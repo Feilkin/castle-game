@@ -1,5 +1,6 @@
 //! AMD FidelityFX Super Resolution 1.0 implementation
-use crate::widgets::Widget;
+use std::any::Any;
+
 use bevy::core_pipeline::clear_color::ClearColorConfig;
 use bevy::prelude::*;
 use bevy::reflect::TypeUuid;
@@ -7,15 +8,15 @@ use bevy::render::camera::{RenderTarget, ScalingMode, Viewport};
 use bevy::render::mesh::MeshVertexBufferLayout;
 use bevy::render::render_resource::{
     AsBindGroup, Extent3d, RenderPipelineDescriptor, ShaderRef, ShaderType,
-    SpecializedMeshPipelineError, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureUsages,
+    SpecializedMeshPipelineError, TextureDimension, TextureFormat, TextureUsages,
 };
 use bevy::render::texture::BevyDefault;
 use bevy::render::view::RenderLayers;
 use bevy::sprite::{Material2d, Material2dKey, Material2dPlugin, MaterialMesh2dBundle};
 use bevy_egui::egui::{Slider, Ui};
 use bevy_egui::{egui, EguiContext};
-use std::any::Any;
+
+use crate::widgets::Widget;
 
 pub struct FsrPlugin;
 
@@ -257,7 +258,7 @@ fn update_fsr_settings(
     settings: Res<FsrSettings>,
     upscale_entity: Res<UpscaleEntity>,
     camera_entity: Res<CameraEntity>,
-    mut upscale_query: Query<&Handle<UpscaleMaterial>>,
+    upscale_query: Query<&Handle<UpscaleMaterial>>,
     mut upscale_mats: ResMut<Assets<UpscaleMaterial>>,
     mut camera_query: Query<&mut Camera>,
     windows: Res<Windows>,
