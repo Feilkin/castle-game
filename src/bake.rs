@@ -95,7 +95,7 @@ pub struct BakeSettings {
 impl Default for BakeSettings {
     fn default() -> Self {
         BakeSettings {
-            voxel_size: Vec3::new(512., 512., 64.),
+            voxel_size: Vec3::new(1024., 1024., 64.),
             heightmap_size: 1024.,
             erosion_inertia: 0.05,
             erosion_capacity: 8.,
@@ -111,7 +111,7 @@ impl Default for BakeSettings {
 impl Default for VoxelSettings {
     fn default() -> Self {
         VoxelSettings {
-            voxel_res: [512, 512, 64],
+            voxel_res: [1024, 1024, 64],
         }
     }
 }
@@ -562,7 +562,7 @@ impl RenderNode for BakeSdfVoxelNode {
                     .unwrap();
                 pass.set_pipeline(bake_pipeline);
                 pass.dispatch_workgroups(
-                    dbg!(voxel_settings.voxel_res[0] / WORKGROUP_SIZE),
+                    voxel_settings.voxel_res[0] / WORKGROUP_SIZE,
                     voxel_settings.voxel_res[1] / WORKGROUP_SIZE,
                     voxel_settings.voxel_res[2] / WORKGROUP_SIZE,
                 );

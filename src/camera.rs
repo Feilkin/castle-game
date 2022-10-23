@@ -1,16 +1,21 @@
 //! Pan orbit camera
+use bevy::core_pipeline::clear_color::ClearColorConfig;
+use bevy::core_pipeline::core_3d::Camera3dDepthLoadOp;
 use bevy::input::mouse::{MouseMotion, MouseWheel};
 use bevy::prelude::*;
 use bevy::render::camera::Projection;
+use bevy_egui::{egui, EguiContext};
 
 use crate::fsr::FsrSettings;
+use crate::raymarching::RaymarchCameraEntity;
 
 pub struct CameraPlugin;
 
 impl Plugin for CameraPlugin {
     fn build(&self, app: &mut App) {
         app.add_startup_system(spawn_camera)
-            .add_system(pan_orbit_camera);
+            .add_system(pan_orbit_camera)
+            .add_system(fov_slider);
     }
 }
 
@@ -36,18 +41,45 @@ impl Default for PanOrbitCamera {
 fn spawn_camera(mut commands: Commands) {
     let translation = Vec3::new(10.2, 142.7, 100.8);
     let radius = 175.;
-    let mut projection = PerspectiveProjection::default();
-    projection.fov = 75.;
-
+    let mut projection = PerspectiveProjection {
+        fov: 75f32.to_radians(),
+        aspect_ratio: 16. / 9.,
+        near: 0.1,
+        far: 10000.0,
+    };
+    let transform =
+        Transform::from_translation(translation).looking_at(Vec3::new(0., 0., 1.), Vec3::Z);
     commands
-        .spawn_bundle((
-            Transform::from_translation(translation).looking_at(Vec3::new(0., 0., 1.), Vec3::Z),
-            Projection::from(projection),
-        ))
+        .spawn_bundle(Camera3dBundle {
+            camera: Camera {
+                priority: 31,
+                ..default()
+            },
+            projection: projection.into(),
+            transform,
+            camera_3d: Camera3d {
+                clear_color: ClearColorConfig::None,
+                depth_load_op: Camera3dDepthLoadOp::Clear(0.),
+            },
+            ..default()
+        })
         .insert(PanOrbitCamera {
             radius,
             ..Default::default()
-        });
+        })
+        .insert(RaymarchCameraEntity);
+}
+
+fn fov_slider(mut query: Query<&mut Projection>, mut egui_context: ResMut<EguiContext>) {
+    egui::Window::new("Camera").show(egui_context.ctx_mut(), |ui| {
+        for mut projection in query.iter_mut() {
+            if let Projection::Perspective(ref mut pers) = &mut *projection {
+                let mut temp = pers.fov.to_degrees();
+                ui.add(egui::Slider::new(&mut temp, 10.0..=180.0));
+                pers.fov = temp.to_radians();
+            }
+        }
+    });
 }
 
 /// Pan the camera with middle mouse click, zoom with scroll wheel, orbit with right mouse click.
@@ -58,6 +90,7 @@ fn pan_orbit_camera(
     input_mouse: Res<Input<MouseButton>>,
     mut query: Query<(&mut PanOrbitCamera, &mut Transform, &Projection)>,
     upscale_settings: Res<FsrSettings>,
+    time: Res<Time>,
 ) {
     // change input mapping for orbit and panning here
     let orbit_button = MouseButton::Right;
@@ -77,6 +110,9 @@ fn pan_orbit_camera(
         for ev in ev_motion.iter() {
             pan += ev.delta;
         }
+    } else {
+        // rotate with time
+        rotation_move += Vec2::new(1., 0.) * time.delta_seconds() * 3.;
     }
     for ev in ev_scroll.iter() {
         scroll += ev.y;
@@ -125,7 +161,7 @@ fn pan_orbit_camera(
             // let right = Vec3::X * pan.x;
             // let up = Vec3::Y * -pan.y;
             // make panning proportional to distance away from focus point
-            let translation = (right + up) * 1.0;
+            let translation = (right + up) * pan_orbit.radius;
             pan_orbit.focus += translation;
         } else if scroll.abs() > 0.0 {
             any = true;

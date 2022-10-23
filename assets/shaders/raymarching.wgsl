@@ -1,3 +1,6 @@
+let PI = 3.141592653589793238462643383279502884197;
+let E = 2.718281828459045235360287471352662497757;
+
 struct View {
     view_proj: mat4x4<f32>,
     inverse_view_proj: mat4x4<f32>,
@@ -36,6 +39,8 @@ struct RaymarchCamera {
     fov: f32,
     view_matrix: mat4x4<f32>,
     view_matrix_inverse: mat4x4<f32>,
+    projection_matrix: mat4x4<f32>,
+    projection_matrix_inverse: mat4x4<f32>,
 }
 
 let play_area_size = vec3<f32>(511., 511., 64.);
@@ -43,38 +48,53 @@ let play_area_size_h = vec3<f32>(255., 255., 64.);
 let heightmap_size = vec2<f32>(1023., 1023.);
 let voxel_size = vec3<f32>(511., 511., 64.);
 
-struct Towers {
-    count: u32,
-    towers: array<vec4<f32>, 32>,
-}
-
-struct Walls {
-    count: u32,
-    walls: array<vec4<f32>, 32>,
-}
-
 struct World {
     time: f32,
 }
 
+struct Globals {
+    camera: RaymarchCamera,
+    world: World,
+    sky_settings: SkySettings,
+}
+
+struct EntityData {
+    position: vec3<f32>,
+    z_rotation: f32,
+    kind: i32,
+    data: vec3<f32>,
+    data2: vec4<f32>,
+}
+
+struct BvhNode {
+    /// Minimum of the AABB
+    min: vec3<f32>,
+    /// Maximum of the AABB
+    max: vec3<f32>,
+    /// Left child index, or -1 if leaf node
+    left: i32,
+    /// Right child index, or entity index if leaf node
+    right: i32,
+}
+
+struct BvhTree {
+    tree: array<BvhNode>
+}
+
 @group(1) @binding(0)
-var<uniform> raymarch_camera: RaymarchCamera;
+var<uniform> globals: Globals;
 @group(1) @binding(1)
-var texture: texture_2d<f32>;
+var<storage> entity_data: array<EntityData>;
 @group(1) @binding(2)
-var our_sampler: sampler;
+var<storage> bvh: BvhTree;
 @group(1) @binding(3)
-var<uniform> towers: Towers;
+var texture: texture_2d<f32>;
 @group(1) @binding(4)
-var<uniform> walls: Walls;
+var our_sampler: sampler;
 @group(1) @binding(5)
 var voxel_data: texture_3d<f32>;
 @group(1) @binding(6)
 var voxel_sampler: sampler;
-@group(1) @binding(7)
-var<uniform> world: World;
-@group(1) @binding(8)
-var<uniform> sky_settings: SkySettings;
 
 struct FragmentInput {
     @builtin(position) position: vec4<f32>,
@@ -82,6 +102,12 @@ struct FragmentInput {
     @location(1) world_normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
 }
+
+struct HitEntities {
+    count: u32,
+    entities: array<EntityData, 10>,
+}
+var<private> hit_entities: HitEntities;
 
 fn hsv2rgb(c: vec3<f32>) -> vec3<f32> {
     let K = vec4<f32>(1., 2. / 3., 1. / 3., 3.);
@@ -108,7 +134,7 @@ fn modulo_vec2(a: vec2<f32>, b: vec2<f32>) -> vec2<f32> {
 // ray direction in view space (Y up)
 fn ray_direction(fieldOfView: f32, size: vec2<f32>, fragCoord: vec2<f32>) -> vec3<f32> {
     let xy = fragCoord - size / 2.0;
-    let z = size.y / tan(radians(fieldOfView) / 2.0);
+    let z = size.y / tan(fieldOfView * 1.52 / 2.0);
     return normalize(vec3<f32>(xy.x, -xy.y, -z));
 }
 
@@ -238,6 +264,24 @@ fn sdGateway(p: vec3<f32>, b: vec3<f32>) -> f32 {
     return d;
 }
 
+fn sdEntity(entity_index: u32, ray_pos: vec3<f32>, current_distance: f32) -> vec2<f32> {
+    let entity = hit_entities.entities[entity_index];
+    var ret = vec2(current_distance, -1.);
+
+    switch (entity.kind) {
+        case 1: {
+            let tower_d = sdTower(ray_pos - entity.position - vec3(0., 0., 3.), entity.data.x, ret.x);
+            if (tower_d < ret.x) {
+                ret.x = tower_d;
+                ret.y = 2.;
+            }
+        }
+        default : {}
+    }
+
+    return ret;
+}
+
 fn ground_at(p: vec2<f32>) -> f32 {
     let p = p + play_area_size_h.xy;
 //    var uv = modulo_vec2(p - vec2<f32>(-128., -128.), vec2<f32>(512., 512.)) / vec2<f32>(511., 511.);
@@ -250,57 +294,59 @@ fn sdGround(p: vec3<f32>) -> f32 {
     let p = p + vec3<f32>(play_area_size_h.xy, 0.);
 //    if (p.x < 0. || p.x > 1023. || p.y < 0. || p.y > 1023.) { return p.z; }
 //    var uv = modulo_vec3(p  - vec3<f32>(-128., -128., 0.), vec3<f32>(512., 512., 300.)) / vec3<f32>(511., 511., 63.);
-    var uv = p / play_area_size * vec3<f32>(0.5, 0.5, 1.);
+    var uv = p / play_area_size;
     return textureSampleLevel(voxel_data, voxel_sampler, uv, 0.).r;
 }
 
-fn map(ray_pos: vec3<f32>, ray_distance: f32, shadow_pass: bool) -> vec2<f32> {
+fn calculate_ground_normal(pos: vec2<f32>) -> vec3<f32> {
+    let e = vec2<f32>(1.0,0.0)*0.47734231*0.7;
+    return normalize(vec3<f32>(
+        2.*(ground_at(pos + e.xy) - ground_at(pos - e.xy))/e.x,
+        2.*(ground_at(pos + e.yx) - ground_at(pos - e.yx))/e.x,
+        4.
+    ));
+}
+
+
+fn map(ray_pos: vec3<f32>, ray_dir: vec3<f32>, ray_distance: f32, shadow_pass: bool) -> vec2<f32> {
     let wall_height = 1.5;
     var ret = vec2<f32>(1000., 2.);
 
     // ground
     var r = sdGround(ray_pos);
     ret.x = min(r, ret.x);
-//    if (ret.x <= 0.001) {
-        ret.y = 1.;
+    ret.y = 1.;
+
+    for (var i = 0u; i < hit_entities.count; i++) {
+        let entity_ret = sdEntity(i, ray_pos, ret.x);
+        if (entity_ret.x < ret.x) {
+            ret.x = entity_ret.x;
+            ret.y = entity_ret.y;
+        }
+    }
+
+
+//    for (var i = 0u; i < walls.count; i++) {
+//        let wall = walls.walls[i];
+//        let wall_len = wall.w;
+//        let wall_rot = wall.z;
+//        let wall_pos = vec3<f32>(wall.xy, 0.5);
+//        let ground_level_w = ground_at(ray_pos.xy);
+//        let local_pos = rotateZ(ray_pos - wall_pos, -wall_rot) - vec3<f32>(-wall_len / 2.0, 0., 0.9 + ground_level_w);
+//
+//        let bb_box = sdBox(local_pos, vec3<f32>(wall_len / 2. + 0.5, 1.2, wall_height + 1.5));
+//
+//        if (bb_box < ret.x) {
+//            let wall_d = sdWall(local_pos, vec3<f32>(wall_len / 2., 1., wall_height));
+//
+//            if (wall_d < ret.x) {
+//                ret.y = 2.;
+//            }
+////            ret.x = opSmoothUnion(ret.x, wall_d, 0.1);
+//            ret.x = min(ret.x, wall_d);
+//            ret.x = max(-sdGateway(local_pos - vec3<f32>(0., 0., 2.38), vec3<f32>(wall_len / 2.0 + 0.4, 0.7, 0.9)), ret.x);
+//        }
 //    }
-
-    for (var i = 0u; i < towers.count; i++) {
-        let tower = towers.towers[i];
-        let tower_pos = tower.xyz;
-        let ground_level_t = ground_at(tower.xy);
-        let bb_sphere = sdSphere(ray_pos - tower_pos - vec3<f32>(0., 0., 3. + ground_level_t), tower.w * 1.2);
-//        let bb_sphere = 0.;
-        if (bb_sphere < ret.x) {
-            let tower_d = sdTower(ray_pos - tower_pos - vec3<f32>(0., 0., 3. + ground_level_t), tower.w, ret.x);
-            if (tower_d < ret.x) {
-                ret.x = tower_d;
-                ret.y = 2.;
-            }
-        }
-    }
-
-    for (var i = 0u; i < walls.count; i++) {
-        let wall = walls.walls[i];
-        let wall_len = wall.w;
-        let wall_rot = wall.z;
-        let wall_pos = vec3<f32>(wall.xy, 0.5);
-        let ground_level_w = ground_at(ray_pos.xy);
-        let local_pos = rotateZ(ray_pos - wall_pos, -wall_rot) - vec3<f32>(-wall_len / 2.0, 0., 0.9 + ground_level_w);
-
-        let bb_box = sdBox(local_pos, vec3<f32>(wall_len / 2. + 0.5, 1.2, wall_height + 1.5));
-
-        if (bb_box < ret.x) {
-            let wall_d = sdWall(local_pos, vec3<f32>(wall_len / 2., 1., wall_height));
-
-            if (wall_d < ret.x) {
-                ret.y = 2.;
-            }
-//            ret.x = opSmoothUnion(ret.x, wall_d, 0.1);
-            ret.x = min(ret.x, wall_d);
-            ret.x = max(-sdGateway(local_pos - vec3<f32>(0., 0., 2.38), vec3<f32>(wall_len / 2.0 + 0.4, 0.7, 0.9)), ret.x);
-        }
-    }
 
     // main gate
     ret.x = max(-sdGateway(ray_pos - vec3<f32>(0., 0., 1.), vec3<f32>(1.5, 2., 1.4)), ret.x);
@@ -312,7 +358,63 @@ fn map(ray_pos: vec3<f32>, ray_distance: f32, shadow_pass: bool) -> vec2<f32> {
     return ret;
 }
 
+fn ray_intersects_aabb(ray_pos: vec3<f32>, ray_dir: vec3<f32>, bb_min: vec3<f32>, bb_max: vec3<f32>) -> bool {
+    let dirfrac = 1. / ray_dir;
+    let t135 = (bb_min - ray_pos) * dirfrac;
+    let t246 = (bb_max - ray_pos) * dirfrac;
+
+    let tmin = max(max(min(t135.x, t246.x), min(t135.y, t246.y)), min(t135.z, t246.z));
+    let tmax = min(min(max(t135.x, t246.x), max(t135.y, t246.y)), max(t135.z, t246.z));
+
+    // AABB behind ray
+    if (tmax < 0.) {
+        return false;
+    }
+
+    // ray doesn't intersect
+    if (tmin > tmax) {
+        return false;
+    }
+
+    return true;
+}
+
+fn bvh_lookup_ray(ray_pos: vec3<f32>, ray_dir: vec3<f32>) {
+    var queue: array<u32, 128>;
+    var sp = 0;
+
+    // reset hit_entities
+    hit_entities.count = 0u;
+
+    // load root to queue
+    queue[0] = 0u;
+
+    loop {
+        if (sp < 0) { break; }
+        // pop node from stack
+        let node_id = queue[sp];
+        sp--;
+        let node = bvh.tree[node_id];
+
+        let ray_hit = ray_intersects_aabb(ray_pos, ray_dir, node.min, node.max);
+        if (ray_hit) {
+            if (node.left == -1) {
+                // leaf node, right is entity data index
+                hit_entities.entities[hit_entities.count] = entity_data[node.right];
+                hit_entities.count++;
+            } else {
+                // branch node, left and right are indices for the child nodes
+                // push the child nodes to queue
+                queue[sp + 1] = u32(node.left);
+                queue[sp + 2] = u32(node.right);
+                sp += 2;
+            }
+        }
+    }
+}
+
 fn raymarch(ray_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
+    bvh_lookup_ray(ray_pos, ray_dir);
     let max_steps = MAX_RT_STEPS;
     let epsilon = 0.01;
 
@@ -342,7 +444,7 @@ fn raymarch(ray_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
 //        let map_bb = sdBox(pos, vec3<f32>(45., 25., 25.));
 //
 //        if ((map_bb <= res.x) || res.x == -1.) {
-            let d = map(pos, t, false);
+            let d = map(pos, ray_dir, t, false);
 
             t += d.x;
 
@@ -385,9 +487,9 @@ fn sky_dir_to_sun(p: vec3<f32>) -> vec3<f32> {
 
 fn sky_density_at(p: vec3<f32>) -> f32 {
     let planet_center = vec3<f32>(0., 0., 0.);
-    let planet_radius = sky_settings.planet_radius;
-    let atmosphere_radius = planet_radius + sky_settings.atmosphere_radius;
-    let density_falloff = sky_settings.density_falloff;
+    let planet_radius = globals.sky_settings.planet_radius;
+    let atmosphere_radius = planet_radius + globals.sky_settings.atmosphere_radius;
+    let density_falloff = globals.sky_settings.density_falloff;
     let height_above_surface = length(p - planet_center) - planet_radius;
     let height01 = height_above_surface / (atmosphere_radius - planet_radius);
     let local_density = exp(-height01 * density_falloff);
@@ -424,10 +526,10 @@ fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
         let sunray_length = ray_sphere_intersection(planet_center, atmosphere_radius, inscatter_point, dir_to_sun);
         let sunray_optical_depth = sky_optical_depth(inscatter_point, dir_to_sun, sunray_length);
         let viewray_optical_depth = sky_optical_depth(inscatter_point, -ray_dir, step_size * f32(i));
-        let transmittance = exp(-(sunray_optical_depth + viewray_optical_depth) * sky_settings.scatter_coefficients);
+        let transmittance = exp(-(sunray_optical_depth + viewray_optical_depth) * globals.sky_settings.scatter_coefficients);
         let local_density = sky_density_at(inscatter_point);
 
-        inscattered_light += local_density * transmittance * sky_settings.scatter_coefficients * step_size;
+        inscattered_light += local_density * transmittance * globals.sky_settings.scatter_coefficients * step_size;
         inscatter_point += ray_dir * step_size;
     }
 
@@ -470,6 +572,7 @@ fn map_color(color: f32, ray_pos: vec3<f32>, normal: vec3<f32>, ray_dir: vec3<f3
     if (color == 4.0) { return vec3<f32>(0.32, 0.11, 0.03); }
     if (color == 5.0) { return vec3<f32>(0.81, 0.11, 0.13); }
     if (color == 6.0) { return vec3<f32>(0.71, 0.31, 0.23); }
+    if (color == 7.0) { return vec3<f32>(0.37, 0.71, 0.13); }
 
     if (color >= 100.) {
         return hsv2rgb(vec3<f32>(color - 100., 0.8, 0.5));
@@ -490,6 +593,7 @@ fn map_color(color: f32, ray_pos: vec3<f32>, normal: vec3<f32>, ray_dir: vec3<f3
 
 fn calculate_soft_shadow(ray_origin: vec3<f32>, ray_dir: vec3<f32>, distance_from_eye: f32) -> f32 {
     if (distance_from_eye > 500.) { return 1.; }
+    bvh_lookup_ray(ray_origin, ray_dir);
     var res = 1.0;
     var t = 0.2;
 
@@ -499,7 +603,7 @@ fn calculate_soft_shadow(ray_origin: vec3<f32>, ray_dir: vec3<f32>, distance_fro
         step += 1;
         if (step >= max_steps) { break; }
 
-        let h = map(ray_origin + ray_dir * t, 1.0, true).x;
+        let h = map(ray_origin + ray_dir * t, ray_dir, 1.0, true).x;
         let s = clamp(8.0*h/t, 0., 1.);
         res = min(res, s);
         t += clamp(h, 0.06, 0.4);
@@ -510,20 +614,11 @@ fn calculate_soft_shadow(ray_origin: vec3<f32>, ray_dir: vec3<f32>, distance_fro
 }
 
 fn calculate_normal(pos: vec3<f32>, distance_from_eye: f32) -> vec3<f32> {
-    let e = vec2<f32>(1.0,-1.0)*0.57734231*0.000005;
-    return normalize( e.xyy * (map( pos + e.xyy, distance_from_eye, false).x) +
-                      e.yyx * (map( pos + e.yyx, distance_from_eye, false).x) +
-                      e.yxy * (map( pos + e.yxy, distance_from_eye, false).x) +
-                      e.xxx * (map( pos + e.xxx, distance_from_eye, false).x) );
-}
-
-fn calculate_ground_normal(pos: vec2<f32>) -> vec3<f32> {
-    let e = vec2<f32>(1.0,0.0)*0.47734231*.7;
-    return normalize(vec3<f32>(
-        2.*(ground_at(pos + e.xy) - ground_at(pos - e.xy))/e.x,
-        2.*(ground_at(pos + e.yx) - ground_at(pos - e.yx))/e.x,
-        4.
-    ));
+    let e = vec2<f32>(1.0,-1.0)*0.57734231*0.00005;
+    return normalize( e.xyy * (map( pos + e.xyy, vec3(1., 0., 0.), distance_from_eye, false).x) +
+                      e.yyx * (map( pos + e.yyx, vec3(0., 0., 1.), distance_from_eye, false).x) +
+                      e.yxy * (map( pos + e.yxy, vec3(0., 1., 0.), distance_from_eye, false).x) +
+                      e.xxx * (map( pos + e.xxx, vec3(0., 0., 0.), distance_from_eye, false).x) );
 }
 
 fn calculate_ao(pos: vec3<f32>, normal: vec3<f32>) -> f32 {
@@ -531,7 +626,7 @@ fn calculate_ao(pos: vec3<f32>, normal: vec3<f32>) -> f32 {
     var sca = 1.0;
     for (var i = 0; i < 5; i += 1) {
         let h = 0.01 + 0.12 * f32(i)/4.0;
-        let d = map(pos + h*normal, 0.01, true).x;
+        let d = map(pos + h*normal, vec3(0., 0., 0.), 0.01, true).x;
         occ += (h-d) * sca;
         sca *= 0.95;
         if (occ > 0.35) { break; }
@@ -539,20 +634,36 @@ fn calculate_ao(pos: vec3<f32>, normal: vec3<f32>) -> f32 {
     return clamp(1.0 - 3.0*occ, 0.0, 1.0) * (0.5 + 0.5*normal.z);
 }
 
+struct FragmentOutput {
+    @builtin(frag_depth) depth: f32,
+    @location(0) color: vec4<f32>,
+}
+
 @fragment
-fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {
+fn fragment(in: FragmentInput) -> FragmentOutput {
+    hit_entities.count = 2u;
+    hit_entities.entities[0] = entity_data[1];
+    hit_entities.entities[1] = entity_data[2];
+
     let AA = 1;
     var total = vec3<f32>(0.);
+    var total_distance = 0.;
     for (var m=0; m<AA; m++) {
     for (var n=0; n<AA; n++) {
         let o = vec2<f32>(f32(m), f32(n)) / 4. - 0.5;
         let p = in.position.xy + o;
 
-        let ray_in_view_space = ray_direction(raymarch_camera.fov, vec2<f32>(view.width, view.height), p);
-        let ray_dir_unnorm = raymarch_camera.view_matrix_inverse * vec4<f32>(ray_in_view_space, 0.0);
-        let ray_dir = normalize(ray_dir_unnorm.xyz);
+        let ray_in_view_space = ray_direction(globals.camera.fov, vec2<f32>(view.width, view.height), p);
 
-        let ray_pos: vec3<f32> = (raymarch_camera.view_matrix_inverse * vec4<f32>(0., 0., 0., 1.)).xyz;
+//        let ray_ndc = normalize(vec4((in.uv.x * 2. - 1.), (1. - in.uv.y * 2.), 1., 0.));
+//        let ray_dir = (raymarch_camera.projection_matrix_inverse * ray_ndc).xyz;
+//        let ray_dir = ray_in_view_space * vec3(1., 1., 1.);
+//        let ray_dir = ray_dir * vec3(1., 1., 1.);
+        let ray_dir_unnorm = globals.camera.view_matrix_inverse * vec4<f32>(ray_in_view_space.xyz, 0.0);
+        let ray_dir = normalize(ray_dir_unnorm.xyz);
+//        let ray_dir = ray_ndc.xyz;
+
+        let ray_pos: vec3<f32> = (globals.camera.view_matrix_inverse * vec4<f32>(0., 0., 0., 1.)).xyz;
         let ray_pos = ray_pos;
 
         let res = raymarch(ray_pos, ray_dir);
@@ -596,30 +707,30 @@ fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {
                 }
                 // point lights
                 {
-                    for (var i = 0u; i < towers.count; i++) {
-                        let tower = towers.towers[i];
-                        let tower_pos = tower.xyz;
-                        let ground_level_t = ground_at(tower.xy);
-                        let local_pos = pos - vec3<f32>(tower_pos.x, tower_pos.y, 3.0 + ground_level_t);
-                        let dist = length(local_pos);
-                        if (dist < 10.) {
-                            let intensity = 1. / pow(dist, 4.) * 1500.;
-                            let lig = normalize(-local_pos);
-                            let hal = normalize(lig-ray_dir);
-                            var dif = clamp(dot(normal, lig), 0.0, 1.0);
-                            dif *= calculate_soft_shadow(pos, lig, distance_from_eye);
-            //                var spe = pow(clamp(dot(normal, hal), 0.0, 1.0), 16.0);
-            //                spe *= dif;
-            //                spe *= 0.04*0.96*pow(clamp(1.0-dot(hal, lig), 0.0, 1.0), 5.0);
-                            light_acc += intensity*color*2.2*dif*vec3<f32>(1.0, 0.33, 0.0);
-            //                light_acc += 5.*spe*vec3<f32>(1.3, 1., 0.6)*1.0;
-                        }
-                    }
+//                    for (var i = 0u; i < towers.count; i++) {
+//                        let tower = towers.towers[i];
+//                        let tower_pos = tower.xyz;
+//                        let ground_level_t = ground_at(tower.xy);
+//                        let local_pos = pos - vec3<f32>(tower_pos.x, tower_pos.y, 3.0 + ground_level_t);
+//                        let dist = length(local_pos);
+//                        if (dist < 10.) {
+//                            let intensity = 1. / pow(dist, 4.) * 1500.;
+//                            let lig = normalize(-local_pos);
+//                            let hal = normalize(lig-ray_dir);
+//                            var dif = clamp(dot(normal, lig), 0.0, 1.0);
+//                            dif *= calculate_soft_shadow(pos, lig, distance_from_eye);
+//            //                var spe = pow(clamp(dot(normal, hal), 0.0, 1.0), 16.0);
+//            //                spe *= dif;
+//            //                spe *= 0.04*0.96*pow(clamp(1.0-dot(hal, lig), 0.0, 1.0), 5.0);
+//                            light_acc += intensity*color*2.2*dif*vec3<f32>(1.0, 0.33, 0.0);
+//            //                light_acc += 5.*spe*vec3<f32>(1.3, 1., 0.6)*1.0;
+//                        }
+//                    }
 
                 }
                 // sky (ambient)
                 {
-                    let daytime_coeff = 1. - min(max(sin(world.time)* 3., 0.0), 0.97);
+                    let daytime_coeff = 1. - min(max(sin(globals.world.time)* 3., 0.0), 0.97);
                     let sky_bounce = reflect(dir_to_sun, normal);
                     let sky_reflect_color = max(sky_color(sky_bounce) * 0.37, vec3<f32>(0.02, 0.02, 0.17));
                     var dif = sqrt(clamp(0.5+0.5*normal.z, 0.0, 1.0));
@@ -638,18 +749,20 @@ fn fragment(in: FragmentInput) -> @location(0) vec4<f32> {
                 color = mix(color, fog_color, 1.0-exp(-0.00001*pow(t, 2.1)));
 
 //                color = vec3<f32>(t / 1000., res.z / f32(MAX_RT_STEPS), 0.);
-//                color = vec3<f32>(t / 250., 0., 0.);
+//                color = vec3<f32>(t / 1000., 0., 0.);
 //                color = vec3<f32>(0., 0., select(0., 1., normal.z > 0.93));
 //                color = normal;
 //                color = vec3<f32>(occ, 0., 0.);
 //                color = vec3<f32>(max(ground_at(pos.xy), 0.) / 100.,-min(ground_at(pos.xy), 0.) / 100., 0.);
 //                color = vec3<f32>(m / 5., 0., 0.);
             }
+//                color = ray_dir;
             total += color;
+            total_distance += res.x;
         }
 
     }
     }
 
-    return vec4<f32>(total / f32(AA*AA), 1.0);
+    return FragmentOutput(total_distance / f32(AA*AA), vec4<f32>(total / f32(AA*AA), 1.0));
 }
