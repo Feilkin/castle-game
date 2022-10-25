@@ -54,8 +54,8 @@ fn main() {
             ..default()
         })
         .insert_resource(WindowDescriptor {
-            width: 1280.0,
-            height: 720.0,
+            width: 1920.0,
+            height: 1080.0,
             present_mode: PresentMode::AutoVsync,
             ..Default::default()
         })
@@ -72,6 +72,7 @@ fn main() {
         .add_plugin(ExtractResourcePlugin::<World>::default())
         .add_startup_system(setup)
         .add_startup_system(print_render_limits)
+        .add_system(update_world)
         .run();
 }
 
@@ -100,70 +101,77 @@ fn setup(
         ..default()
     });
 
-    spawn_tower(
-        &mut commands,
-        Transform::from_translation(Vec3::new(-12., 0., 0.)),
-        4.,
-        &image,
-    );
-    spawn_tower(
-        &mut commands,
-        Transform::from_translation(Vec3::new(12., 0., 0.)),
-        4.,
-        &image,
-    );
-    spawn_tower(
-        &mut commands,
-        Transform::from_translation(Vec3::new(-12., -20., 0.)),
-        4.,
-        &image,
-    );
-    spawn_tower(
-        &mut commands,
-        Transform::from_translation(Vec3::new(12., -20., 0.)),
-        4.,
-        &image,
-    );
-
-    spawn_tower(
-        &mut commands,
-        Transform::from_translation(Vec3::new(-8., -10., 0.)),
-        7.,
-        &image,
-    );
-    spawn_tower(
-        &mut commands,
-        Transform::from_translation(Vec3::new(8., -10., 0.)),
-        7.,
-        &image,
-    );
-    spawn_tower(
-        &mut commands,
-        Transform::from_translation(Vec3::new(-8., -17., 0.)),
-        7.,
-        &image,
-    );
-    spawn_tower(
-        &mut commands,
-        Transform::from_translation(Vec3::new(8., -17., 0.)),
-        7.,
-        &image,
-    );
+    // spawn_tower(
+    //     &mut commands,
+    //     Transform::from_translation(Vec3::new(-12., 0., 0.)),
+    //     4.,
+    //     &image,
+    // );
+    // spawn_tower(
+    //     &mut commands,
+    //     Transform::from_translation(Vec3::new(12., 0., 0.)),
+    //     4.,
+    //     &image,
+    // );
+    // spawn_tower(
+    //     &mut commands,
+    //     Transform::from_translation(Vec3::new(-12., -20., 0.)),
+    //     4.,
+    //     &image,
+    // );
+    // spawn_tower(
+    //     &mut commands,
+    //     Transform::from_translation(Vec3::new(12., -20., 0.)),
+    //     4.,
+    //     &image,
+    // );
+    //
+    // spawn_tower(
+    //     &mut commands,
+    //     Transform::from_translation(Vec3::new(-8., -10., 0.)),
+    //     7.,
+    //     &image,
+    // );
+    // spawn_tower(
+    //     &mut commands,
+    //     Transform::from_translation(Vec3::new(8., -10., 0.)),
+    //     7.,
+    //     &image,
+    // );
+    // spawn_tower(
+    //     &mut commands,
+    //     Transform::from_translation(Vec3::new(-8., -17., 0.)),
+    //     7.,
+    //     &image,
+    // );
+    // spawn_tower(
+    //     &mut commands,
+    //     Transform::from_translation(Vec3::new(8., -17., 0.)),
+    //     7.,
+    //     &image,
+    // );
 
     for y in 0..10 {
         for x in 0..10 {
             spawn_tower(
                 &mut commands,
                 Transform::from_translation(Vec3::new(
-                    x as f32 * 10. + 10.,
-                    y as f32 * 10. + 10.,
+                    x as f32 * 10. - 150.,
+                    y as f32 * 10. - 150.,
                     0.,
                 )),
-                7.,
+                14.,
                 &image,
             );
         }
     }
+
+    spawn_tower(
+        &mut commands,
+        Transform::from_translation(Vec3::new(-90., 10., 0.)),
+        14.,
+        &image,
+    );
 }
 
 fn spawn_tower(commands: &mut Commands, mut transform: Transform, height: f32, heightmap: &Image) {
@@ -188,6 +196,10 @@ fn spawn_tower(commands: &mut Commands, mut transform: Transform, height: f32, h
 #[derive(ShaderType, Clone, Default, ExtractResource)]
 struct World {
     time: f32,
+}
+
+fn update_world(mut world: ResMut<World>, time: Res<Time>) {
+    world.time += time.delta_seconds();
 }
 
 fn generate_perlin_noise(width: u32, height: u32) -> Image {

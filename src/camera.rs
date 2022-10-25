@@ -26,6 +26,7 @@ pub struct PanOrbitCamera {
     pub focus: Vec3,
     pub radius: f32,
     pub upside_down: bool,
+    pub auto_rotate: bool,
 }
 
 impl Default for PanOrbitCamera {
@@ -34,6 +35,7 @@ impl Default for PanOrbitCamera {
             focus: Vec3::ZERO,
             radius: 5.0,
             upside_down: false,
+            auto_rotate: false,
         }
     }
 }
@@ -70,14 +72,22 @@ fn spawn_camera(mut commands: Commands) {
         .insert(RaymarchCameraEntity);
 }
 
-fn fov_slider(mut query: Query<&mut Projection>, mut egui_context: ResMut<EguiContext>) {
+fn fov_slider(
+    mut query: Query<(&mut Projection, &mut PanOrbitCamera)>,
+    mut egui_context: ResMut<EguiContext>,
+) {
     egui::Window::new("Camera").show(egui_context.ctx_mut(), |ui| {
-        for mut projection in query.iter_mut() {
+        for (mut projection, mut pan_orbit) in query.iter_mut() {
             if let Projection::Perspective(ref mut pers) = &mut *projection {
                 let mut temp = pers.fov.to_degrees();
                 ui.add(egui::Slider::new(&mut temp, 10.0..=180.0));
                 pers.fov = temp.to_radians();
             }
+
+            ui.add(egui::Checkbox::new(
+                &mut pan_orbit.auto_rotate,
+                "Auto rotate",
+            ));
         }
     });
 }
@@ -110,9 +120,6 @@ fn pan_orbit_camera(
         for ev in ev_motion.iter() {
             pan += ev.delta;
         }
-    } else {
-        // rotate with time
-        rotation_move += Vec2::new(1., 0.) * time.delta_seconds() * 3.;
     }
     for ev in ev_scroll.iter() {
         scroll += ev.y;
@@ -127,6 +134,10 @@ fn pan_orbit_camera(
             // if the camera is "upside" down, panning horizontally would be inverted, so invert the input to make it correct
             let up = transform.rotation * Vec3::Z;
             pan_orbit.upside_down = up.z <= 0.0;
+        }
+
+        if pan_orbit.auto_rotate {
+            rotation_move += Vec2::new(1., 0.) * time.delta_seconds() * 3.;
         }
 
         let mut any = false;

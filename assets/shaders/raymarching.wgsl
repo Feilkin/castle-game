@@ -282,6 +282,28 @@ fn sdEntity(entity_index: u32, ray_pos: vec3<f32>, current_distance: f32) -> vec
     return ret;
 }
 
+fn sdWater(ray_pos: vec3<f32>) -> vec2<f32> {
+    var waves = array(
+        vec4(0.1, 0.4, 1., 1.),
+        vec4(0.08, 0.3, -0.93, 3.),
+        vec4(0.1, 0.47, 1., 7.),
+        vec4(0.04, 0.8, 2., 1.5),
+        vec4(0.051, 0.81, 1.97, 3.),
+        vec4(0.061, 0.93, -1.81, -13.),
+        vec4(0.003, 2.1, 2., 1.041),
+        vec4(0.0021, 3.7, 1.97, 3.512),
+        vec4(0.0011, 5.1, -1.81, -6.12),
+    );
+    var wave_acc = 0.;
+
+    for (var i = 0; i < 9; i++) {
+        let wave = waves[i];
+        wave_acc += sin(ray_pos.x * wave.y + wave.w + globals.world.time * wave.z) * wave.x;
+    }
+
+    return vec2(ray_pos.z - 1. + wave_acc, -2.);
+}
+
 fn ground_at(p: vec2<f32>) -> f32 {
     let p = p + play_area_size_h.xy;
 //    var uv = modulo_vec2(p - vec2<f32>(-128., -128.), vec2<f32>(512., 512.)) / vec2<f32>(511., 511.);
@@ -316,6 +338,12 @@ fn map(ray_pos: vec3<f32>, ray_dir: vec3<f32>, ray_distance: f32, shadow_pass: b
     var r = sdGround(ray_pos);
     ret.x = min(r, ret.x);
     ret.y = 1.;
+
+    // water
+    let w = sdWater(ray_pos);
+    if (w.x <= ret.x) {
+        ret = w;
+    }
 
     for (var i = 0u; i < hit_entities.count; i++) {
         let entity_ret = sdEntity(i, ray_pos, ret.x);
@@ -379,6 +407,12 @@ fn ray_intersects_aabb(ray_pos: vec3<f32>, ray_dir: vec3<f32>, bb_min: vec3<f32>
     return true;
 }
 
+fn aabb_intersects_aabb(a_min: vec3<f32>, a_max: vec3<f32>, b_min: vec3<f32>, b_max: vec3<f32>) -> bool {
+    return (a_min.x <= b_max.x && a_max.x >= b_min.x) &&
+           (a_min.y <= b_max.y && a_max.y >= b_min.y) &&
+           (a_min.z <= b_max.z && a_max.z >= b_min.z);
+}
+
 fn bvh_lookup_ray(ray_pos: vec3<f32>, ray_dir: vec3<f32>) {
     var queue: array<u32, 128>;
     var sp = 0;
@@ -397,6 +431,40 @@ fn bvh_lookup_ray(ray_pos: vec3<f32>, ray_dir: vec3<f32>) {
         let node = bvh.tree[node_id];
 
         let ray_hit = ray_intersects_aabb(ray_pos, ray_dir, node.min, node.max);
+        if (ray_hit) {
+            if (node.left == -1) {
+                // leaf node, right is entity data index
+                hit_entities.entities[hit_entities.count] = entity_data[node.right];
+                hit_entities.count++;
+            } else {
+                // branch node, left and right are indices for the child nodes
+                // push the child nodes to queue
+                queue[sp + 1] = u32(node.left);
+                queue[sp + 2] = u32(node.right);
+                sp += 2;
+            }
+        }
+    }
+}
+
+fn bvh_lookup_aabb(target_min: vec3<f32>, target_max: vec3<f32>) {
+    var queue: array<u32, 128>;
+    var sp = 0;
+
+    // reset hit_entities
+    hit_entities.count = 0u;
+
+    // load root to queue
+    queue[0] = 0u;
+
+    loop {
+        if (sp < 0) { break; }
+        // pop node from stack
+        let node_id = queue[sp];
+        sp--;
+        let node = bvh.tree[node_id];
+
+        let ray_hit = aabb_intersects_aabb(target_min, target_max, node.min, node.max);
         if (ray_hit) {
             if (node.left == -1) {
                 // leaf node, right is entity data index
@@ -433,9 +501,8 @@ fn raymarch(ray_pos: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
     var t = tmin;
     loop {
         step += 1;
-        if (step >= max_steps) { break; }
+        if (step >= max_steps) { res.x = t; break; }
         let pos = ray_pos + ray_dir * t;
-        if (pos.z < 0.) { res.y = -2.; break; }
         if (pos.x > play_area_size_h.x && ray_dir.x > 0.) { break; }
         if (pos.y > play_area_size_h.y && ray_dir.y > 0.) { break; }
         if (pos.x < -play_area_size_h.x && ray_dir.x < 0.) { break; }
@@ -538,11 +605,6 @@ fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
 
 fn map_color(color: f32, ray_pos: vec3<f32>, normal: vec3<f32>, ray_dir: vec3<f32>) -> vec3<f32> {
     if (color == 1.0) {
-        if (ground_at(ray_pos.xy) < 0.) {
-            // hole
-            return vec3<f32>(0.43, 0.43, 0.13) * (1. - max(-ray_pos.z / 16., 1.0));
-        }
-
         var ground_color = vec3<f32>(0.43, 0.43, 0.13);
 
         if (ray_pos.z > 26. + sin(ray_pos.y * .2 + ray_pos.x * 0.03)) {
@@ -584,8 +646,9 @@ fn map_color(color: f32, ray_pos: vec3<f32>, normal: vec3<f32>, ray_dir: vec3<f3
     }
     if (color == -2.0) {
         // water
-        let bounce = reflect(ray_dir, vec3<f32>(0., 0., 1.));
-        return sky_color(bounce);
+//        let bounce = reflect(ray_dir, vec3<f32>(0., 0., 1.));
+//        return sky_color(bounce);
+        return vec3(1., 0., 1.);
     }
 
     return vec3<f32>(1., 0., 1.);
@@ -614,7 +677,8 @@ fn calculate_soft_shadow(ray_origin: vec3<f32>, ray_dir: vec3<f32>, distance_fro
 }
 
 fn calculate_normal(pos: vec3<f32>, distance_from_eye: f32) -> vec3<f32> {
-    let e = vec2<f32>(1.0,-1.0)*0.57734231*0.00005;
+    let e = vec2<f32>(1.0,-1.0)*0.57734231*0.03;
+    bvh_lookup_aabb(pos + e.yyy * 4., pos + e.xxx * 4.);
     return normalize( e.xyy * (map( pos + e.xyy, vec3(1., 0., 0.), distance_from_eye, false).x) +
                       e.yyx * (map( pos + e.yyx, vec3(0., 0., 1.), distance_from_eye, false).x) +
                       e.yxy * (map( pos + e.yxy, vec3(0., 1., 0.), distance_from_eye, false).x) +
@@ -634,6 +698,32 @@ fn calculate_ao(pos: vec3<f32>, normal: vec3<f32>) -> f32 {
     return clamp(1.0 - 3.0*occ, 0.0, 1.0) * (0.5 + 0.5*normal.z);
 }
 
+fn calculate_light(ray_pos: vec3<f32>, ray_dir: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    // TODO: materials
+    let shininess = 200.;
+    let diffuse_coeff = 1.;
+    let specular_coeff = 1.0;
+    // TODO: occlusion
+    var light_acc = vec3(0.);
+    // sun light
+    {
+        // TODO: sun color
+        let sun_color = vec3(1.3, 1.1, 0.7);
+        let sun_dir = sky_dir_to_sun(ray_pos);
+        let sun_shadow = calculate_soft_shadow(ray_pos, sun_dir, 1.);
+
+        // phong
+        let half_way = normalize(sun_dir - ray_dir);
+        let diffuse = clamp(dot(normal, sun_dir), 0., 1.) * sun_shadow * sun_color;
+        let specular = clamp(pow(dot(reflect(-sun_dir, normal), -ray_dir), shininess), 0., 1.);
+
+        light_acc += diffuse_coeff * diffuse + specular_coeff * specular;
+//        light_acc = vec3(sun_shadow);
+    }
+
+    return light_acc;
+}
+
 struct FragmentOutput {
     @builtin(frag_depth) depth: f32,
     @location(0) color: vec4<f32>,
@@ -645,7 +735,7 @@ fn fragment(in: FragmentInput) -> FragmentOutput {
     hit_entities.entities[0] = entity_data[1];
     hit_entities.entities[1] = entity_data[2];
 
-    let AA = 1;
+    let AA = 2;
     var total = vec3<f32>(0.);
     var total_distance = 0.;
     for (var m=0; m<AA; m++) {
@@ -660,7 +750,7 @@ fn fragment(in: FragmentInput) -> FragmentOutput {
 //        let ray_dir = ray_in_view_space * vec3(1., 1., 1.);
 //        let ray_dir = ray_dir * vec3(1., 1., 1.);
         let ray_dir_unnorm = globals.camera.view_matrix_inverse * vec4<f32>(ray_in_view_space.xyz, 0.0);
-        let ray_dir = normalize(ray_dir_unnorm.xyz);
+        var ray_dir = normalize(ray_dir_unnorm.xyz);
 //        let ray_dir = ray_ndc.xyz;
 
         let ray_pos: vec3<f32> = (globals.camera.view_matrix_inverse * vec4<f32>(0., 0., 0., 1.)).xyz;
@@ -670,11 +760,14 @@ fn fragment(in: FragmentInput) -> FragmentOutput {
 
 
         if (res.z == f32(MAX_RT_STEPS)) {
-            total += vec3<f32>(0., 0., 0.07);
+            let fog_color = vec3<f32>(0.8, 0.8, 0.9);
+            total += mix(vec3(0.0, 0.0, 0.07), fog_color, 1.0-exp(-0.00001*pow(res.x, 2.1)));
+//            total += vec3(0.0, 0.0, 0.07);
         } else {
             let t = res.x;
             var m = res.y;
-            let pos = ray_pos + ray_dir * t;
+            var smoothness = 0.5;
+            var pos = ray_pos + ray_dir * t;
             let distance_from_eye = distance(ray_pos, pos);
             var normal = vec3<f32>(0., 0., 1.);
             if (m > 0.5 && m < 1.5) {
@@ -686,76 +779,58 @@ fn fragment(in: FragmentInput) -> FragmentOutput {
             }
         //    let normal = select(vec3<f32>(0., 0., 1.), calculate_normal(pos), m > 1.5);
             var color = map_color(m, pos, normal, ray_dir);
+            if (m == -2.) {
+                let water_pos = pos;
+                let water_ray_dir = ray_dir;
+                let water_normal = calculate_normal(water_pos, distance_from_eye);
+                for (var water_bounce = 0; water_bounce < 50; water_bounce++) {
+                    let bounce = reflect(ray_dir, normal);
+                    let bounce_start = pos + bounce * 0.3;
+                    let reflection = raymarch(bounce_start, bounce);
+                    let reflection_pos = bounce_start + bounce * reflection.x;
+                    var reflection_normal = vec3<f32>(0., 0., 1.);
+                    if (reflection.y > 0.5 && reflection.y < 1.5) {
+                        normal = calculate_ground_normal(reflection_pos.xy);
+                    } else if (reflection.y > 1.5) {
+                        normal = calculate_normal(reflection_pos, distance_from_eye);
+                    }
+                    color = map_color(reflection.y, reflection_pos, normal, bounce);
+                    // mix in with shore color if shallow
+                    let shore_color = map_color(1., pos, normal, ray_dir);
+                    let water_depth = pos.z - ground_at(pos.xy);
+                    let water_factor = 1. - clamp(pow(water_depth * .617, 1.), 0., 1.);
+                    color = mix(color, shore_color, water_factor);
+                    m = reflection.y;
+                    pos = reflection_pos;
+                    ray_dir = bounce;
+                    if (m != -2.) { break; }
+                }
+
+                // hacky water specular
+                let shininess = 200.;
+                let sun_color = vec3(1.3, 1.1, 0.7);
+                let sun_dir = sky_dir_to_sun(water_pos);
+
+                let specular = clamp(pow(dot(reflect(sun_dir, water_normal), water_ray_dir), shininess), 0., 1.);
+
+                color += 1.0 * specular * sun_color;
+            }
 
             if (m > 0.) {
-                var light_acc = vec3<f32>(0.);
-                let occ = calculate_ao(pos, normal);
-
-                // sun
-                let dir_to_sun = sky_dir_to_sun(pos);
-                if (dir_to_sun.z > -0.47) {
-                    let sun_color = mix(sky_color(dir_to_sun), vec3<f32>(1.3, 1.0, 0.7), 0.5 * clamp(dir_to_sun.z, 0., 1.));
-                    let lig = dir_to_sun;
-                    let hal = normalize(lig-ray_dir);
-                    var dif = clamp(dot(normal, lig), 0.0, 1.0);
-                    dif *= calculate_soft_shadow(pos, lig, distance_from_eye);
-    //                var spe = pow(clamp(dot(normal, hal), 0.0, 1.0), 16.0);
-    //                spe *= dif;
-    //                spe *= 0.04*0.96*pow(clamp(1.0-dot(hal, lig), 0.0, 1.0), 5.0);
-                    light_acc += color*1.2*dif*sun_color;
-    //                light_acc += 5.*spe*vec3<f32>(1.3, 1., 0.6)*1.0;
-                }
-                // point lights
-                {
-//                    for (var i = 0u; i < towers.count; i++) {
-//                        let tower = towers.towers[i];
-//                        let tower_pos = tower.xyz;
-//                        let ground_level_t = ground_at(tower.xy);
-//                        let local_pos = pos - vec3<f32>(tower_pos.x, tower_pos.y, 3.0 + ground_level_t);
-//                        let dist = length(local_pos);
-//                        if (dist < 10.) {
-//                            let intensity = 1. / pow(dist, 4.) * 1500.;
-//                            let lig = normalize(-local_pos);
-//                            let hal = normalize(lig-ray_dir);
-//                            var dif = clamp(dot(normal, lig), 0.0, 1.0);
-//                            dif *= calculate_soft_shadow(pos, lig, distance_from_eye);
-//            //                var spe = pow(clamp(dot(normal, hal), 0.0, 1.0), 16.0);
-//            //                spe *= dif;
-//            //                spe *= 0.04*0.96*pow(clamp(1.0-dot(hal, lig), 0.0, 1.0), 5.0);
-//                            light_acc += intensity*color*2.2*dif*vec3<f32>(1.0, 0.33, 0.0);
-//            //                light_acc += 5.*spe*vec3<f32>(1.3, 1., 0.6)*1.0;
-//                        }
-//                    }
-
-                }
-                // sky (ambient)
-                {
-                    let daytime_coeff = 1. - min(max(sin(globals.world.time)* 3., 0.0), 0.97);
-                    let sky_bounce = reflect(dir_to_sun, normal);
-                    let sky_reflect_color = max(sky_color(sky_bounce) * 0.37, vec3<f32>(0.02, 0.02, 0.17));
-                    var dif = sqrt(clamp(0.5+0.5*normal.z, 0.0, 1.0));
-                    if (m > 0.) {
-                        dif *= occ;
-                    }
-                    if (m > 2. || ground_at(pos.xy) > 0.) {
-                        light_acc += color*dif*sky_reflect_color;
-                    }
-                }
-
-//                color = mix(light_acc, normal, 0.1);
-                color = light_acc;
+                var light_acc = calculate_light(pos, ray_dir, normal);
+                color = light_acc * color;
                 // fog
-                let fog_color = vec3<f32>(0.7, 0.7, 0.9)*sky_color(vec3<f32>(0., 0., 1.));
+                let fog_color = vec3<f32>(0.8, 0.8, 0.9);
                 color = mix(color, fog_color, 1.0-exp(-0.00001*pow(t, 2.1)));
+            }
 
 //                color = vec3<f32>(t / 1000., res.z / f32(MAX_RT_STEPS), 0.);
-//                color = vec3<f32>(t / 1000., 0., 0.);
+//                color = vec3<f32>(t / 10., 0., 0.);
 //                color = vec3<f32>(0., 0., select(0., 1., normal.z > 0.93));
 //                color = normal;
 //                color = vec3<f32>(occ, 0., 0.);
 //                color = vec3<f32>(max(ground_at(pos.xy), 0.) / 100.,-min(ground_at(pos.xy), 0.) / 100., 0.);
 //                color = vec3<f32>(m / 5., 0., 0.);
-            }
 //                color = ray_dir;
             total += color;
             total_distance += res.x;
