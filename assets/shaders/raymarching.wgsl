@@ -284,24 +284,29 @@ fn sdEntity(entity_index: u32, ray_pos: vec3<f32>, current_distance: f32) -> vec
 
 fn sdWater(ray_pos: vec3<f32>) -> vec2<f32> {
     var waves = array(
-        vec4(0.1, 0.4, 1., 1.),
-        vec4(0.08, 0.3, -0.93, 3.),
-        vec4(0.1, 0.47, 1., 7.),
-        vec4(0.04, 0.8, 2., 1.5),
-        vec4(0.051, 0.81, 1.97, 3.),
-        vec4(0.061, 0.93, -1.81, -13.),
-        vec4(0.003, 2.1, 2., 1.041),
-        vec4(0.0021, 3.7, 1.97, 3.512),
-        vec4(0.0011, 5.1, -1.81, -6.12),
+        vec4(0.1, 0.04, 1., 1.),
+        vec4(0.08, 0.03, -0.93, 3.),
+        vec4(0.1, 0.047, 1., 7.),
+        vec4(0.04, 0.08, 2., 1.5),
+        vec4(0.1, 0.04, 1., 11.),
+        vec4(0.08, 0.03, -0.93, 13.),
+        vec4(0.1, 0.047, 1., 17.),
+        vec4(0.1, 0.14, 1., 311.),
+        vec4(0.08, 0.13, -0.93, 313.),
+        vec4(0.1, 0.147, 1., 317.),
+        vec4(0.04, 0.18, 2., 311.5),
     );
     var wave_acc = 0.;
 
-    for (var i = 0; i < 9; i++) {
+    for (var i = 0; i < 11; i++) {
         let wave = waves[i];
-        wave_acc += sin(ray_pos.x * wave.y + wave.w + globals.world.time * wave.z) * wave.x;
+        wave_acc += sin(sin(ray_pos.x * wave.y + globals.world.time * wave.z) + wave.w + globals.world.time * wave.z) * wave.x;
+        wave_acc -= sin(sin(ray_pos.y * wave.y * 2. + globals.world.time * wave.z) + f32(i) - wave.w*1.74 + globals.world.time * wave.z) * 0.71 * wave.x;
     }
 
-    return vec2(ray_pos.z - 1. + wave_acc, -2.);
+    let cube = sdBox(ray_pos - vec3(0., 0., 15.), vec3(3.));
+
+    return vec2(min(ray_pos.z - 1., cube) + wave_acc, -2.);
 }
 
 fn ground_at(p: vec2<f32>) -> f32 {
@@ -323,8 +328,8 @@ fn sdGround(p: vec3<f32>) -> f32 {
 fn calculate_ground_normal(pos: vec2<f32>) -> vec3<f32> {
     let e = vec2<f32>(1.0,0.0)*0.47734231*0.7;
     return normalize(vec3<f32>(
-        2.*(ground_at(pos + e.xy) - ground_at(pos - e.xy))/e.x,
-        2.*(ground_at(pos + e.yx) - ground_at(pos - e.yx))/e.x,
+        2.*(ground_at(pos - e.xy) - ground_at(pos + e.xy))/e.x,
+        2.*(ground_at(pos - e.yx) - ground_at(pos + e.yx))/e.x,
         4.
     ));
 }
@@ -585,6 +590,8 @@ fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
     var inscatter_point = vec3<f32>(0., 0., earth_radius);
     let distance_to_sky = ray_sphere_intersection(planet_center, atmosphere_radius, inscatter_point, ray_dir);
 
+    let sun_color = vec3(1.3, 1.1, 0.7);
+
     let step_size = distance_to_sky / f32(inscattering_points - 1);
     var inscattered_light = vec3(0.);
 
@@ -596,10 +603,11 @@ fn sky_color(ray_dir: vec3<f32>) -> vec3<f32> {
         let transmittance = exp(-(sunray_optical_depth + viewray_optical_depth) * globals.sky_settings.scatter_coefficients);
         let local_density = sky_density_at(inscatter_point);
 
+        let specular = clamp(pow(dot(dir_to_sun, ray_dir), 200.), 0., 1.);
         inscattered_light += local_density * transmittance * globals.sky_settings.scatter_coefficients * step_size;
         inscatter_point += ray_dir * step_size;
+        inscattered_light += specular * sun_color * transmittance * step_size;
     }
-
     return inscattered_light;
 }
 
@@ -702,7 +710,7 @@ fn calculate_light(ray_pos: vec3<f32>, ray_dir: vec3<f32>, normal: vec3<f32>) ->
     // TODO: materials
     let shininess = 200.;
     let diffuse_coeff = 1.;
-    let specular_coeff = 1.0;
+    let specular_coeff = 0.0;
     // TODO: occlusion
     var light_acc = vec3(0.);
     // sun light
@@ -710,6 +718,7 @@ fn calculate_light(ray_pos: vec3<f32>, ray_dir: vec3<f32>, normal: vec3<f32>) ->
         // TODO: sun color
         let sun_color = vec3(1.3, 1.1, 0.7);
         let sun_dir = sky_dir_to_sun(ray_pos);
+        let sun_color = sky_color(sun_dir);
         let sun_shadow = calculate_soft_shadow(ray_pos, sun_dir, 1.);
 
         // phong
@@ -735,7 +744,7 @@ fn fragment(in: FragmentInput) -> FragmentOutput {
     hit_entities.entities[0] = entity_data[1];
     hit_entities.entities[1] = entity_data[2];
 
-    let AA = 2;
+    let AA = 1;
     var total = vec3<f32>(0.);
     var total_distance = 0.;
     for (var m=0; m<AA; m++) {
@@ -783,37 +792,31 @@ fn fragment(in: FragmentInput) -> FragmentOutput {
                 let water_pos = pos;
                 let water_ray_dir = ray_dir;
                 let water_normal = calculate_normal(water_pos, distance_from_eye);
-                for (var water_bounce = 0; water_bounce < 50; water_bounce++) {
+                var reflection_color = vec3(0.);
+                // first normal is not calculated for the water
+                normal = water_normal;
+                for (var water_bounce = 0; water_bounce < 3; water_bounce++) {
                     let bounce = reflect(ray_dir, normal);
-                    let bounce_start = pos + bounce * 0.3;
+                    let bounce_start = pos - ray_dir * 0.1 + bounce * 0.1;
                     let reflection = raymarch(bounce_start, bounce);
                     let reflection_pos = bounce_start + bounce * reflection.x;
                     var reflection_normal = vec3<f32>(0., 0., 1.);
                     if (reflection.y > 0.5 && reflection.y < 1.5) {
                         normal = calculate_ground_normal(reflection_pos.xy);
-                    } else if (reflection.y > 1.5) {
+                    } else if (reflection.y > 1.5 || reflection.y == -2.) {
                         normal = calculate_normal(reflection_pos, distance_from_eye);
                     }
-                    color = map_color(reflection.y, reflection_pos, normal, bounce);
-                    // mix in with shore color if shallow
-                    let shore_color = map_color(1., pos, normal, ray_dir);
-                    let water_depth = pos.z - ground_at(pos.xy);
-                    let water_factor = 1. - clamp(pow(water_depth * .617, 1.), 0., 1.);
-                    color = mix(color, shore_color, water_factor);
+                    reflection_color = map_color(reflection.y, reflection_pos, normal, bounce);
                     m = reflection.y;
                     pos = reflection_pos;
                     ray_dir = bounce;
                     if (m != -2.) { break; }
                 }
-
-                // hacky water specular
-                let shininess = 200.;
-                let sun_color = vec3(1.3, 1.1, 0.7);
-                let sun_dir = sky_dir_to_sun(water_pos);
-
-                let specular = clamp(pow(dot(reflect(sun_dir, water_normal), water_ray_dir), shininess), 0., 1.);
-
-                color += 1.0 * specular * sun_color;
+                // mix in with shore color if shallow
+                let water_depth = pos.z - ground_at(pos.xy);
+                let refraction_color = mix(map_color(1., water_pos, normal, ray_dir), vec3(0., 0.1, 0.1), clamp(pow(water_depth, 0.5), 0., 1.));
+                let reflection_factor = clamp(pow(dot(water_normal, water_ray_dir), 2.), 0., 1.);
+                color = mix(reflection_color, refraction_color, reflection_factor);
             }
 
             if (m > 0.) {
